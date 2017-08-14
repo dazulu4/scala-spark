@@ -1,14 +1,14 @@
 package stackoverflow
 
+import scala.annotation.tailrec
+
 import org.apache.spark.SparkConf
 import org.apache.spark.SparkContext
-import org.apache.spark.SparkContext._
 import org.apache.spark.rdd.RDD
-import annotation.tailrec
-import scala.reflect.ClassTag
 
 /** A raw stackoverflow posting, either a question or an answer */
 case class Posting(postingType: Int, id: Int, acceptedAnswer: Option[Int], parentId: Option[Int], score: Int, tags: Option[String]) extends Serializable
+
 
 /** The main class */
 object StackOverflow extends StackOverflow {
@@ -19,18 +19,20 @@ object StackOverflow extends StackOverflow {
   /** Main function */
   def main(args: Array[String]): Unit = {
 
-    val lines = sc.textFile("src/main/resources/stackoverflow/stackoverflow.csv")
-    val raw = rawPostings(lines)
+    val lines   = sc.textFile("src/main/resources/stackoverflow/stackoverflow.csv")
+    val raw     = rawPostings(lines)
     val grouped = groupedPostings(raw)
-    val scored = scoredPostings(grouped)
+    val scored  = scoredPostings(grouped)
     val vectors = vectorPostings(scored)
-    //    assert(vectors.count() == 2121822, "Incorrect number of vectors: " + vectors.count())
+//    assert(vectors.count() == 2121822, "Incorrect number of vectors: " + vectors.count())
 
-    val means = kmeans(sampleVectors(vectors), vectors, debug = true)
+    val means   = kmeans(sampleVectors(vectors), vectors, debug = true)
     val results = clusterResults(means, vectors)
     printResults(results)
+    sc.stop()
   }
 }
+
 
 /** The parsing and kmeans methods */
 class StackOverflow extends Serializable {
@@ -54,6 +56,7 @@ class StackOverflow extends Serializable {
   /** K-means parameter: Maximum iterations */
   def kmeansMaxIterations = 120
 
+
   //
   //
   // Parsing utilities:
@@ -64,38 +67,43 @@ class StackOverflow extends Serializable {
   def rawPostings(lines: RDD[String]): RDD[Posting] =
     lines.map(line => {
       val arr = line.split(",")
-      Posting(postingType = arr(0).toInt,
-        id = arr(1).toInt,
-        acceptedAnswer = if (arr(2) == "") None else Some(arr(2).toInt),
-        parentId = if (arr(3) == "") None else Some(arr(3).toInt),
-        score = arr(4).toInt,
-        tags = if (arr.length >= 6) Some(arr(5).intern()) else None)
+      Posting(postingType =    arr(0).toInt,
+              id =             arr(1).toInt,
+              acceptedAnswer = if (arr(2) == "") None else Some(arr(2).toInt),
+              parentId =       if (arr(3) == "") None else Some(arr(3).toInt),
+              score =          arr(4).toInt,
+              tags =           if (arr.length >= 6) Some(arr(5).intern()) else None)
     })
+
 
   /** Group the questions and answers together */
   def groupedPostings(postings: RDD[Posting]): RDD[(Int, Iterable[(Posting, Posting)])] = {
-    val questions = postings.filter(post => post.postingType == 1).map(post => (post.id, post))
-    val answers = postings.filter(post => post.postingType == 2 && post.parentId.isDefined).map(post => (post.parentId.get, post))
+    val questions: RDD[(Int, Posting)] = postings.filter(_.postingType == 1).map(q => (q.id, q))
+    val answers: RDD[(Int, Posting)] = postings.filter(_.postingType == 2).map(a => (a.parentId.get, a))
     questions.join(answers).groupByKey()
   }
+
 
   /** Compute the maximum score for each posting */
   def scoredPostings(grouped: RDD[(Int, Iterable[(Posting, Posting)])]): RDD[(Posting, Int)] = {
 
     def answerHighScore(as: Array[Posting]): Int = {
       var highScore = 0
-      var i = 0
-      while (i < as.length) {
-        val score = as(i).score
-        if (score > highScore)
-          highScore = score
-        i += 1
-      }
+          var i = 0
+          while (i < as.length) {
+            val score = as(i).score
+                if (score > highScore)
+                  highScore = score
+                  i += 1
+          }
       highScore
     }
 
-    grouped.flatMap(_._2).groupByKey().mapValues(_.toArray).mapValues(answerHighScore)
+    grouped.map {
+      case (_, qas: Iterable[(Posting, Posting)]) => (qas.head._1, answerHighScore(qas.map(_._2).toArray))
+    }
   }
+
 
   /** Compute the vectors for the kmeans */
   def vectorPostings(scored: RDD[(Posting, Int)]): RDD[(Int, Int)] = {
@@ -107,14 +115,24 @@ class StackOverflow extends Serializable {
       else {
         val tmp = firstLangInTag(tag, ls.tail)
         tmp match {
-          case None    => None
+          case None => None
           case Some(i) => Some(i + 1) // index i in ls.tail => index i+1
         }
       }
     }
 
-    scored.map { case (p, s) => (firstLangInTag(p.tags, langs).get * langSpread, s) }
+    val vectors = scored.flatMap {
+      case (posting, score) => {
+        firstLangInTag(posting.tags, langs) match {
+          case None => None
+          case Some(lang) => Some((lang * langSpread, score))
+        }
+      }
+    }
+
+    vectors.cache()
   }
+
 
   /** Sample the vectors */
   def sampleVectors(vectors: RDD[(Int, Int)]): Array[(Int, Int)] = {
@@ -158,6 +176,7 @@ class StackOverflow extends Serializable {
     res
   }
 
+
   //
   //
   //  Kmeans method:
@@ -166,9 +185,17 @@ class StackOverflow extends Serializable {
 
   /** Main kmeans computation */
   @tailrec final def kmeans(means: Array[(Int, Int)], vectors: RDD[(Int, Int)], iter: Int = 1, debug: Boolean = false): Array[(Int, Int)] = {
-    val newMeans = means.clone() // you need to compute newMeans
+    val newMeans: Array[(Int, Int)] = means.clone()
+    val newClusters =  vectors
+      .map(vec => (findClosest(vec, means), vec))
+      .groupByKey()
+      .mapValues(averageVectors)
+      .collect()
 
-    // TODO: Fill in the newMeans array
+    newClusters.foreach {
+      case (index, newMean) => newMeans(index) = newMean
+    }
+
     val distance = euclideanDistance(means, newMeans)
 
     if (debug) {
@@ -177,8 +204,8 @@ class StackOverflow extends Serializable {
                  |  * desired distance: $kmeansEta
                  |  * means:""".stripMargin)
       for (idx <- 0 until kmeansKernels)
-        println(f"   ${means(idx).toString}%20s ==> ${newMeans(idx).toString}%20s  " +
-          f"  distance: ${euclideanDistance(means(idx), newMeans(idx))}%8.0f")
+      println(f"   ${means(idx).toString}%20s ==> ${newMeans(idx).toString}%20s  " +
+              f"  distance: ${euclideanDistance(means(idx), newMeans(idx))}%8.0f")
     }
 
     if (converged(distance))
@@ -191,6 +218,9 @@ class StackOverflow extends Serializable {
     }
   }
 
+
+
+
   //
   //
   //  Kmeans utilities:
@@ -201,6 +231,7 @@ class StackOverflow extends Serializable {
   def converged(distance: Double) =
     distance < kmeansEta
 
+
   /** Return the euclidean distance between two points */
   def euclideanDistance(v1: (Int, Int), v2: (Int, Int)): Double = {
     val part1 = (v1._1 - v2._1).toDouble * (v1._1 - v2._1)
@@ -210,10 +241,11 @@ class StackOverflow extends Serializable {
 
   /** Return the euclidean distance between two points */
   def euclideanDistance(a1: Array[(Int, Int)], a2: Array[(Int, Int)]): Double = {
-    assert(a1.length == a2.length)
+//    assert(a1.length == a2.length)
+//    assert(!a1.sameElements(a2))
     var sum = 0d
     var idx = 0
-    while (idx < a1.length) {
+    while(idx < a1.length) {
       sum += euclideanDistance(a1(idx), a2(idx))
       idx += 1
     }
@@ -234,6 +266,7 @@ class StackOverflow extends Serializable {
     bestIndex
   }
 
+
   /** Average the vectors */
   def averageVectors(ps: Iterable[(Int, Int)]): (Int, Int) = {
     val iter = ps.iterator
@@ -249,6 +282,13 @@ class StackOverflow extends Serializable {
     ((comp1 / count).toInt, (comp2 / count).toInt)
   }
 
+  def medianOf(arr: Array[(Int, Int)]): Int = {
+    val len = arr.length
+    if (len % 2 != 0) arr(len / 2)._2
+    else (arr(len / 2)._2 + arr((len / 2) - 1)._2) / 2
+  }
+
+
   //
   //
   //  Displaying results:
@@ -256,24 +296,25 @@ class StackOverflow extends Serializable {
   //
   def clusterResults(means: Array[(Int, Int)], vectors: RDD[(Int, Int)]): Array[(String, Double, Int, Int)] = {
     val closest = vectors.map(p => (findClosest(p, means), p))
-    val closestGrouped = closest.groupByKey()
+    val closestGrouped: RDD[(Int, Iterable[(Int, Int)])] = closest.groupByKey().cache() // (meansIndex, (lang, score))
 
-    val median = closestGrouped.mapValues { vs =>
-      val grouped: Map[Int, Int] = vs
-        .map(_._1 / langSpread) // recomute original index by dividing by the langSpread
-        .groupBy(identity) // group by the index
-        .mapValues(_.size) // get sizes
-      val maxLangIndex = grouped.maxBy(_._2)._1 // get maximum tuple based on size of the group
+    val median = closestGrouped.mapValues { (vs: Iterable[(Int, Int)]) =>
+      val groupedByLang: Iterable[(Int, Iterable[(Int, Int)])] = vs.groupBy(_._1)
+      val mostCommon: (Int, Iterable[(Int, Int)]) = groupedByLang.maxBy(_._2)
+      val langLabel: String = langs(mostCommon._1 / langSpread) // most common language in the cluster
+      val clusterSize: Int    = vs.size
+      val langPercent: Double = if (clusterSize > 0) (mostCommon._2.size.toDouble / clusterSize.toDouble) * 100 else clusterSize // percent of the questions in the most common language
+      val medianScore: Int    = {
+        if (clusterSize == 0) 0
+        else {
+          val sorted = vs.toArray.sortBy(_._2)
+          medianOf(sorted)
+        }
+      }
 
-      val langLabel: String = langs(maxLangIndex) // most common language in the cluster
-      val langPercent: Double = grouped(maxLangIndex) * 100.0d / vs.size // percent of the questions in the most common language
-      val clusterSize: Int = vs.size
-
-      val sortedScores = vs.map(_._2).toList.sorted
-      val middle = clusterSize / 2 // rounds down 3/2 = 1 4/2 = 2 5/2 =2
-      val medianScore: Int = if (clusterSize % 2 == 0) (sortedScores(middle - 1) + sortedScores(middle)) / 2 else sortedScores(middle)
-
-      (langLabel, langPercent, clusterSize, medianScore)
+      val result = (langLabel, langPercent, clusterSize, medianScore)
+      println(result)
+      result
     }
 
     median.collect().map(_._2).sortBy(_._4)
