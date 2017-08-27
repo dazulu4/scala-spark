@@ -1,2 +1,6 @@
 *.class
 *.log
+week1/wikipedia/.cache-main
+week1/wikipedia/.cache-tests
+week1/wikipedia/.classpath
+week1/wikipedia/.project
